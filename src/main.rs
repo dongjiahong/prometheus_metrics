@@ -83,6 +83,8 @@ async fn track_metrics<B>(req: Request<B>, next: Next<B>) -> impl IntoResponse {
         ("status", status),
     ];
 
+    metrics::gauge!("test_gauge", 66f64); // 固定值，不累加
+    metrics::counter!("test_counter", 99); // 每次累加99
     metrics::increment_counter!("http_requests_total", &labels);
     metrics::histogram!("http_request_duration_seconds", latency, &labels);
     response
