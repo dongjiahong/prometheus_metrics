@@ -1,12 +1,7 @@
-use std::{
-    future::ready,
-    net::SocketAddr,
-    str::FromStr,
-    time::{Duration, Instant},
-};
+use std::{future::ready, net::SocketAddr, str::FromStr};
 
 use axum::{
-    extract::MatchedPath,
+    extract::Extension,
     http::Request,
     middleware::{self, Next},
     response::IntoResponse,
@@ -14,7 +9,15 @@ use axum::{
     Router,
 };
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use sea_orm::{entity::*, query::*, DatabaseConnection};
+use tower::ServiceBuilder;
+use tracing::debug;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use entity::{od_miner_configs, od_trades};
+
+pub mod entity;
+pub mod models;
 
 #[tokio::main]
 async fn main() {
@@ -28,16 +31,20 @@ async fn main() {
 
     let recorder_handle = setup_metrics_recorder();
 
+    let db = models::connect_mysql(
+        "mysql://root:KWFoZKxMZIgOc2NFiQkci7PmzeA@172.16.2.117:3306/offline_deal",
+        true,
+        tracing::log::LevelFilter::Trace,
+    )
+    .await;
+
     let app = Router::new()
-        .route("/fase", get(|| async {}))
-        .route(
-            "/slow",
-            get(|| async {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }),
-        )
         .route("/metrics", get(move || ready(recorder_handle.render())))
-        .route_layer(middleware::from_fn(track_metrics));
+        .layer(
+            ServiceBuilder::new()
+                .layer(Extension(db))
+                .layer(middleware::from_fn(track_deal_jobs_mysql)),
+        );
 
     let addr = SocketAddr::from_str("0.0.0.0:8976").unwrap();
     tracing::info!("listen on {:?}", addr);
@@ -54,7 +61,7 @@ fn setup_metrics_recorder() -> PrometheusHandle {
 
     PrometheusBuilder::new()
         .set_buckets_for_metric(
-            Matcher::Full("http_request_duration_seconds".to_string()),
+            Matcher::Full("offline_deal_mysql_jobs".to_string()),
             EXPONENTIAL_SECONDS,
         )
         .unwrap()
@@ -62,30 +69,29 @@ fn setup_metrics_recorder() -> PrometheusHandle {
         .unwrap()
 }
 
-async fn track_metrics<B>(req: Request<B>, next: Next<B>) -> impl IntoResponse {
-    let start = Instant::now();
-    let path = if let Some(matched_path) = req.extensions().get::<MatchedPath>() {
-        matched_path.as_str().to_owned()
-    } else {
-        req.uri().path().to_owned()
-    };
+async fn track_deal_jobs_mysql<B>(req: Request<B>, next: Next<B>) -> impl IntoResponse {
+    debug!("extensions num: {}", req.extensions().len());
 
-    let method = req.method().clone();
+    let db: &DatabaseConnection = req.extensions().get().unwrap();
+    // 1. 从数据库拉取在交易的miner
+    let miners = od_miner_configs::Entity::find()
+        .filter(od_miner_configs::Column::Deleted.eq(0))
+        .filter(od_miner_configs::Column::MinerApiInfo.is_not_null())
+        .all(db)
+        .await
+        .unwrap();
+    // 2. 分别统计不同miner剩下的任务数量
+    for miner in miners {
+        let count = od_trades::Entity::find()
+            .filter(od_trades::Column::Deleted.eq(0))
+            .filter(od_trades::Column::ProposalCid.is_null())
+            .filter(od_trades::Column::MinerId.eq(miner.miner_id.clone()))
+            .count(db)
+            .await
+            .unwrap();
+        let lables = [("miner_id", miner.miner_id.to_string())];
+        metrics::gauge!("offline_deal_jobs", count as f64, &lables);
+    }
 
-    let response = next.run(req).await;
-
-    let latency = start.elapsed().as_secs_f64();
-    let status = response.status().as_u16().to_string();
-
-    let labels = [
-        ("method", method.to_string()),
-        ("path", path),
-        ("status", status),
-    ];
-
-    metrics::gauge!("test_gauge", 66f64); // 固定值，不累加
-    metrics::counter!("test_counter", 99); // 每次累加99
-    metrics::increment_counter!("http_requests_total", &labels);
-    metrics::histogram!("http_request_duration_seconds", latency, &labels);
-    response
+    next.run(req).await
 }
