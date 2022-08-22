@@ -41,6 +41,8 @@ async fn main() {
     let app = Router::new()
         .route("/metrics", get(move || ready(recorder_handle.render())))
         .layer(
+            // 这里的layer实用tower的ServiceBuilder而不是layer和route_layer，
+            // 这要原因可以参考https://docs.rs/axum/latest/axum/middleware/index.html#ordering
             ServiceBuilder::new()
                 .layer(Extension(db))
                 .layer(middleware::from_fn(track_deal_jobs_mysql)),
