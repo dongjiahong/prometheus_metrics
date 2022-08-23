@@ -1,5 +1,6 @@
-use std::{future::ready, net::SocketAddr, str::FromStr};
+use std::{env, future::ready, net::SocketAddr, str::FromStr};
 
+use anyhow::Result;
 use axum::{
     extract::Extension,
     http::Request,
@@ -11,7 +12,7 @@ use axum::{
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use sea_orm::{entity::*, query::*, DatabaseConnection};
 use tower::ServiceBuilder;
-use tracing::debug;
+use tracing::{debug, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use entity::{od_miner_configs, od_trades};
@@ -48,8 +49,9 @@ async fn main() {
                 .layer(middleware::from_fn(track_deal_jobs_mysql)),
         );
 
-    let addr = SocketAddr::from_str("0.0.0.0:8976").unwrap();
-    tracing::info!("listen on {:?}", addr);
+    let port = env::var("PORT").unwrap_or_else(|_| "8976".to_string());
+    let addr = SocketAddr::from_str(format!("0.0.0.0:{}", port).as_ref()).unwrap();
+    info!("listen on {:?}", addr);
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .await
@@ -84,6 +86,7 @@ async fn track_deal_jobs_mysql<B>(req: Request<B>, next: Next<B>) -> impl IntoRe
         .unwrap();
     // 2. 分别统计不同miner剩下的任务数量
     for miner in miners {
+        // 2.1 统计整体任务数量
         let count = od_trades::Entity::find()
             .filter(od_trades::Column::Deleted.eq(0))
             .filter(od_trades::Column::ProposalCid.is_null())
@@ -91,9 +94,58 @@ async fn track_deal_jobs_mysql<B>(req: Request<B>, next: Next<B>) -> impl IntoRe
             .count(db)
             .await
             .unwrap();
+        // 2.2 统计[100m,2G)的文件
+        let f_100m_to_2g = get_count_specify_data_size(&db, 104857600, 2147483648, &miner.miner_id)
+            .await
+            .unwrap();
+        // 2.3 统计[2G,10G)的文件
+        let f_2g_to_10g =
+            get_count_specify_data_size(&db, 2147483648, 10737418240, &miner.miner_id)
+                .await
+                .unwrap();
+        // 2.4 统计[10G,16G)的文件
+        let f_10g_to_16g =
+            get_count_specify_data_size(&db, 10737418240, 17179869184, &miner.miner_id)
+                .await
+                .unwrap();
+        // 2.5 统计[16G,32G)的文件
+        let f_16g_to_32g =
+            get_count_specify_data_size(&db, 17179869184, 34359738368, &miner.miner_id)
+                .await
+                .unwrap();
+
         let lables = [("miner_id", miner.miner_id.to_string())];
         metrics::gauge!("offline_deal_jobs", count as f64, &lables);
+        metrics::gauge!("offline_deal_jobs_100m_2G", f_100m_to_2g as f64, &lables);
+        metrics::gauge!("offline_deal_jobs_2G_10G", f_2g_to_10g as f64, &lables);
+        metrics::gauge!("offline_deal_jobs_10G_16G", f_10g_to_16g as f64, &lables);
+        metrics::gauge!("offline_deal_jobs_16G_32G", f_16g_to_32g as f64, &lables);
     }
 
     next.run(req).await
+}
+
+async fn get_count_specify_data_size(
+    db: &DatabaseConnection,
+    left_size: u64,
+    right_size: u64,
+    miner_id: &str,
+) -> Result<i64> {
+    let res: i64 = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::MySql,
+            format!(
+                "select count(*) as count from od_files where deleted = 0
+    and data_size >= {}
+    and data_size < {}
+    and id in (select file_id from od_trades where proposal_cid is null
+    and deleted = 0
+    and miner_id = '{}')",
+                left_size, right_size, miner_id
+            ),
+        ))
+        .await?
+        .unwrap()
+        .try_get("", "count")?;
+    Ok(res)
 }
