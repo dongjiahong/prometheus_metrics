@@ -11,6 +11,7 @@ use axum::{
 };
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use sea_orm::{entity::*, query::*, DatabaseConnection};
+use serde::Deserialize;
 use tower::ServiceBuilder;
 use tracing::{debug, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -19,6 +20,20 @@ use entity::{od_miner_configs, od_trades};
 
 pub mod entity;
 pub mod models;
+
+#[derive(Deserialize)]
+struct DataCapRespon {
+    stats: Vec<NodeStatus>,
+    //name: String,
+    //deal_count: String,
+}
+
+#[derive(Deserialize)]
+struct NodeStatus {
+    provider: String,
+    //total_deal_size: String,
+    percent: String,
+}
 
 #[tokio::main]
 async fn main() {
@@ -120,6 +135,24 @@ async fn track_deal_jobs_mysql<B>(req: Request<B>, next: Next<B>) -> impl IntoRe
         metrics::gauge!("offline_deal_jobs_2G_10G", f_2g_to_10g as f64, &lables);
         metrics::gauge!("offline_deal_jobs_10G_16G", f_10g_to_16g as f64, &lables);
         metrics::gauge!("offline_deal_jobs_16G_32G", f_16g_to_32g as f64, &lables);
+    }
+
+    // 3. 拉取几点的datacap使用情况
+    let url = "https://api.filplus.d.interplanetary.one/api/getDealAllocationStats/f01878897";
+
+    let resp = reqwest::get(url)
+        .await
+        .unwrap()
+        .json::<DataCapRespon>()
+        .await
+        .unwrap();
+    for stat in resp.stats {
+        let lables = [("miner_id", stat.provider)];
+        metrics::gauge!(
+            "offline_deal_datacap_rate",
+            stat.percent.parse::<f64>().unwrap(),
+            &lables
+        );
     }
 
     next.run(req).await
